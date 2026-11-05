@@ -130,7 +130,16 @@ To remove the card, press and hold **BOOT on the running device** for at least *
 
 ### Clock
 
-At startup, the firmware reads the PCF8563 if it is present and its time is valid. It then uses the ESP32 system clock. **Set the RTC before use**: the current portal does not provide a clock-setting page. Without valid RTC time, date folders and exported calendar timestamps will not be meaningful. The firmware and unpacker treat calendar time as UTC.
+The PCF8563 RTC, system clock and logs use **local wall time without time-zone conversion**. Open **Date and time** on the portal home page:
+
+- **Manually:** enter the local date/time and press **Set time**.
+- **From phone:** press **Use phone time** to save the local calendar fields of the device running the browser.
+
+For example, 18:30 on the phone is stored as 18:30 in the RTC. There is no time-zone selector or UTC conversion. No internet is needed. Phone sync requires JavaScript; manual entry also works without it. Supported years are 2020–2099; invalid calendar dates are rejected.
+
+Both clocks update immediately without rebooting, and RTC persistence is checked by reading it back. If the RTC is missing or an I2C error occurs, the portal reports a system-clock-only update, which may be lost on restart. At startup, valid PCF8563 time is read into the system clock.
+
+Any open CAN log is closed before changing time. The next log uses the new date. Time changes are blocked during an SD test. The unpacker displays stored local time without an additional offset; no time zone is recorded in the log.
 
 ## Logs
 
@@ -186,7 +195,7 @@ Log compression uses **heatshrink 0.4.1**, a third-party LZSS library whose enco
 - Upstream project: [atomicobject/heatshrink](https://github.com/atomicobject/heatshrink).
 - heatshrink has its own **ISC license**; retain the upstream copyright and permission notice when redistributing its sources. See the [upstream license](https://github.com/atomicobject/heatshrink/blob/master/LICENSE).
 
-## CAN FD update — firmware 0.2.3
+## CAN FD update — firmware 0.2.5
 
 The portal displays each controller's mode, nominal/data bitrates and startup failure. Invalid values are rejected before saving. Previous settings migrate automatically; new settings for both channels use one NVS blob. Startup failures are reported in `errors.log`; the firmware does not silently substitute another bitrate.
 

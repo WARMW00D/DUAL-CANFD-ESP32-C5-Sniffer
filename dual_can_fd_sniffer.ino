@@ -159,7 +159,7 @@ void errLog(const char* fmt, ...) {
   struct tm tm; gmtime_r(&t, &tm);
   char ts[24];
   snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-  String line = String(ts) + " [fw 0.2.3, " + String(millis()) + " ms] " + msg + "\r\n";
+  String line = String(ts) + " [fw 0.2.5, " + String(millis()) + " ms] " + msg + "\r\n";
   Serial.print("[ERR] " + line);
   if (!errMutex) errMutex = xSemaphoreCreateMutex();
   if (xSemaphoreTake(errMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -396,7 +396,7 @@ static bool openLogFile() {
   if (!logFile) return false;
   curLogPath = path; fileFrames = 0; fileBytes = 0;
   uint8_t hdr[58]; memset(hdr, 0, sizeof(hdr));
-  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.2.3\0\0\0\0\0\0\0", 12); hdr[21] = 2;
+  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.2.5\0\0\0\0\0\0\0", 12); hdr[21] = 2;
   for (int i = 0; i < 2; i++) {
     int off = 22 + i * 14; hdr[off] = i; uint16_t br = busCfg[i].bitrate / 1000;
     hdr[off+1] = br & 0xFF; hdr[off+2] = (br >> 8) & 0xFF;
@@ -536,7 +536,7 @@ String htmlHead(const String& title) {
 void handleSetLang() {
   saveUiLanguage(server.arg("lang") == "en");
   String back = server.arg("back");
-  if (back != "/logs" && back != "/errors" && back != "/config" && back != "/sd-test") back = "/";
+  if (back != "/logs" && back != "/errors" && back != "/config" && back != "/sd-test" && back != "/clock") back = "/";
   server.sendHeader("Location", back); server.send(303);
 }
 
@@ -600,6 +600,7 @@ void handleRoot() {
     + busStatus + "</ul><p><a href='/config'>" + TR("Настройки шин", "Bus settings") + "</a></p>"
     "<p><a href='/logs'>" + TR("Логи на карте", "Logs on card") + "</a></p>"
     "<p><a href='/errors'>" + TR("Журнал ошибок", "Error log") + "</a></p>"
+    "<p><a href='/clock'>" + TR("Дата и время", "Date and time") + "</a></p>"
     "<p><a href='/sd-test'>" + TR("Тест SD-карты", "SD card test") + "</a></p></body></html>";
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -688,6 +689,92 @@ void handleConfigSave() {
   memcpy(busCfg, next, sizeof(busCfg));
   server.send(200, "text/plain; charset=utf-8", TR("Сохранено, перезагрузка...", "Saved, rebooting..."));
   delay(500); ESP.restart();
+}
+
+// ---------- Установка часов: вручную или часы телефона/браузера ----------
+// Calendar fields represent local wall time. No time-zone conversion.
+static bool clockValueValid(uint64_t value) {
+  return value >= 1577836800ULL && value < 4102444800ULL; // local years 2020..2099
+}
+
+static bool parseClockLocal(const String& text, time_t* out) {
+  size_t n = text.length();
+  if (n != 16 && n != 19) return false;
+  for (size_t i = 0; i < n; i++) {
+    if (i == 4 || i == 7) { if (text[i] != '-') return false; }
+    else if (i == 10) { if (text[i] != 'T') return false; }
+    else if (i == 13 || i == 16) { if (text[i] != ':') return false; }
+    else if (text[i] < '0' || text[i] > '9') return false;
+  }
+  int y, mon, day, h, m, sec = 0;
+  int got = sscanf(text.c_str(), "%d-%d-%dT%d:%d:%d", &y, &mon, &day, &h, &m, &sec);
+  if (got != (n == 19 ? 6 : 5) || y < 2020 || y > 2099 || mon < 1 || mon > 12 ||
+      day < 1 || day > 31 || h > 23 || m > 59 || sec > 59) return false;
+  struct tm fields{};
+  fields.tm_year = y - 1900; fields.tm_mon = mon - 1; fields.tm_mday = day;
+  fields.tm_hour = h; fields.tm_min = m; fields.tm_sec = sec;
+  // UTC helpers pack/unpack fields without applying any offset or DST.
+  time_t value = timegm_utc(&fields);
+  struct tm check{}; gmtime_r(&value, &check);
+  if (check.tm_year != y - 1900 || check.tm_mon != mon - 1 || check.tm_mday != day ||
+      check.tm_hour != h || check.tm_min != m || check.tm_sec != sec) return false;
+  *out = value; return true;
+}
+
+void handleClockPage() {
+  time_t sys = time(nullptr);
+  time_t external = rtc.present ? rtc.now() : 0;
+  bool rtcValid = rtc.present && !rtc.lostPower() && clockValueValid((uint64_t)external);
+  String html = htmlHead(TR("Дата и время", "Date and time")) +
+    "<h2>" + TR("Дата и время", "Date and time") + "</h2><p><a href='/'>" + TR("На главную", "Home") + "</a></p>"
+    "<ul><li>" + TR("Системные часы (местное время)", "System clock (local time)") + ": " +
+    (clockValueValid((uint64_t)sys) ? fmtDateTime(sys) : TR("не установлены", "not set")) + "</li>"
+    "<li>PCF8563: " + (!rtc.present ? TR("не найден", "not found") :
+      (rtcValid ? fmtDateTime(external) : TR("время недостоверно — требуется установка", "time invalid — please set"))) + "</li></ul>"
+    "<p>" + TR("Введите местное время вручную или возьмите его с телефона. В RTC, системных часах и логах используется местное время без пересчёта часовых поясов.",
+                 "Enter local time manually or use your phone clock. RTC, system clock and logs use local wall time without time-zone conversion.") + "</p>"
+    "<h3>" + TR("Установка вручную", "Set manually") + "</h3>"
+    "<form method='POST' action='/clock/set'>"
+    "<input type='datetime-local' id='clockdt' name='dt' step='1' required min='2020-01-01T00:00:00' max='2099-12-31T23:59:59'>"
+    "<br><br><button type='submit'>" + TR("Установить", "Set time") + "</button></form>"
+    "<h3>" + TR("Синхронизация с телефоном", "Synchronise with phone") + "</h3>"
+    "<form method='POST' action='/clock/set' onsubmit='this.elements.dt.value=localValue(new Date())'>"
+    "<input type='hidden' name='dt'><button type='submit'>" + TR("Взять время телефона", "Use phone time") + "</button></form>"
+    "<noscript>" + TR("Для синхронизации с телефоном включите JavaScript в браузере. Ручная установка доступна без него.", "Phone sync requires JavaScript. Manual setting also works without it.") + "</noscript>"
+    "<p>" + TR("Интернет не нужен. После установки время применяется сразу, без перезагрузки. Если RTC отсутствует или недоступен, обновятся только системные часы — до потери питания/перезапуска.",
+                 "No internet is needed. Time changes immediately without rebooting. If the RTC is missing or unavailable, only the system clock is updated, until power loss/restart.") + "</p>"
+    "<script>const pad=n=>String(n).padStart(2,'0');"
+    "function localValue(d){return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());}"
+    "document.getElementById('clockdt').value='" +
+      (clockValueValid((uint64_t)sys) ? fmtDateTime(sys) : String()) + "'.replace(' ','T');"
+    "if(!document.getElementById('clockdt').value)document.getElementById('clockdt').value=localValue(new Date());"
+    "</script></body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleClockSet() {
+  if (sdTest.running) { server.send(409, "text/plain; charset=utf-8", TR("Дождитесь завершения теста SD", "Wait for the SD test to finish")); return; }
+  time_t epoch;
+  if (!parseClockLocal(server.arg("dt"), &epoch)) {
+    server.send(400, "text/plain; charset=utf-8", TR("Некорректные дата/время: допустимы 2020–2099 годы", "Invalid date/time: supported years are 2020–2099")); return;
+  }
+  // The clock must not jump inside an open log, even on the first HTTP request.
+  hadClient = true; paused = true; closeLogFile(3); drainToDummy();
+  struct timeval tv = { epoch, 0 };
+  if (settimeofday(&tv, nullptr) != 0) {
+    server.send(500, "text/plain; charset=utf-8", TR("Не удалось установить системное время", "Cannot set the system clock")); return;
+  }
+  bool rtcSaved = rtc.present && rtc.adjust(epoch);
+  if (rtcSaved) {
+    time_t check = rtc.now();
+    rtcSaved = !rtc.lostPower() && check >= epoch && check <= epoch + 2;
+  }
+  for (int i = 0; i < 2; i++) activityMark[i] = busCtx[i].rxCount;
+  String message = rtcSaved ? TR("Время установлено: PCF8563 и системные часы обновлены.", "Time set: PCF8563 and system clock updated.") :
+    TR("Системное время установлено, но в RTC сохранить не удалось (модуль отсутствует или ошибка I2C).", "System time set, but RTC persistence failed (missing module or I2C error).");
+  String html = htmlHead(TR("Время установлено", "Time set")) + "<h2>" + message + "</h2><p>" + TR("Местное время: ", "Local time: ") + fmtDateTime(epoch) +
+    "</p><p><a href='/clock'>" + TR("Вернуться к настройке часов", "Back to clock settings") + "</a></p></body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
 // ---------- Тест качества SD: алгоритм c5_test_sd_spi, только 20 МГц ----------
@@ -1138,7 +1225,7 @@ static void sleepLoop() {
 void setup() {
   Serial.begin(115200);
   uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10);
-  Serial.println("\n=== dual_can_fd_sniffer 0.2.3 ===");
+  Serial.println("\n=== dual_can_fd_sniffer 0.2.5 ===");
   pinMode(PIN_BOOT, INPUT_PULLUP);
   pinMode(PIN_ACC, INPUT_PULLUP);
   
@@ -1184,6 +1271,8 @@ apActive = apOk;
   server.on("/set-lang", HTTP_POST, handleSetLang);
   server.on("/logs", handleLogsPage);
   server.on("/config", handleConfigPage);
+  server.on("/clock", handleClockPage);
+  server.on("/clock/set", HTTP_POST, handleClockSet);
   server.on("/sd-test", handleSdTestPage);
   server.on("/sd-test/start", HTTP_POST, handleSdTestStart);
   server.on("/api/config", HTTP_POST, handleConfigSave);
