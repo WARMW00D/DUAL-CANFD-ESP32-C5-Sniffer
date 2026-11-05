@@ -22,6 +22,15 @@ def decompress_hs_tolerant(raw):
 
 def read_buses(data, n_bus):
     buses = {}
+    # C5CAN v1 has a fixed 58-byte header and two 14-byte bus records.
+    # Reserved bytes 3..5 now store FD mode and data bitrate (kbit/s).
+    if len(data) >= 58 and data[:8] == HEADER_MAGIC and data[8] == 1 and n_bus == 2:
+        for i in range(n_bus):
+            off = 22 + i * 14
+            index, nominal, mode, data_rate = struct.unpack_from('<BHBH', data, off)
+            name = data[off + 6:off + 14].split(b'\0', 1)[0].decode('utf-8', errors='replace')
+            buses[index] = (name or f'CAN{index}', nominal, mode, data_rate)
+        return buses
     for i in range(n_bus):
         pattern = f"CAN{i}".encode()
         pos = data.find(pattern, 0, min(len(data), 200))
@@ -116,7 +125,11 @@ def unpack_one(path, args):
 
     n_bus = data[21] if len(data) > 21 else 0
     buses = read_buses(data, n_bus)
-    frame_start = find_frame_start(data, n_bus=n_bus)
+    for i, bus in buses.items():
+        if len(bus) == 4 and bus[2]:
+            sys.stderr.write(f"CAN{i} ({bus[0]}): FD nominal={bus[1]} data={bus[3]} kbit/s\n")
+    # Fixed framing also supports files containing just one CAN/FD frame.
+    frame_start = 58 if len(data) >= 58 and data[8] == 1 and n_bus == 2 else find_frame_start(data, n_bus=n_bus)
     if frame_start is None:
         sys.stderr.write(f"skip: no frame data: {path}\n")
         return 0, None
@@ -141,6 +154,7 @@ def unpack_one(path, args):
     else:
         for i in range(n_bus):
             nm = bus_names.get(i, f"B{i}")
+            nm = ''.join(c if c.isalnum() or c in '-_' else '_' for c in nm)
             out_files[i] = open(f"{stem}_{nm}.txt", 'w', encoding='utf-8')
         out_path = f"{stem}_<BUS>.txt"
 
@@ -198,3 +212,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
