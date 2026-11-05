@@ -8,6 +8,8 @@
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 #include "esp_timer.h"
+#include "esp_sleep.h"
+#include <HWCDC.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -33,6 +35,9 @@ extern "C" {
 #define PIN_RTC_SDA     1
 #define PIN_RTC_SCL     6
 #define PIN_BOOT       28
+#define PIN_ACC         0  // PC817 collector; external 10k pull-up to ESP 3V3
+#define ACC_ON_LEVEL    LOW
+#define SLEEP_GRACE_MS  5000UL
 
 // ---------- Настройки ----------
 #define SD_SPI_HZ       20000000UL
@@ -766,11 +771,80 @@ static void pollBootButton() {
   else bootDownMs = 0;
 }
 
+// Native USB host presence (SOF), independent of an open serial monitor.
+// USB chargers / power-only cables cannot be detected without VBUS sensing.
+static bool usbHostConnected() {
+  return HWCDC::isPlugged();
+}
+
+static bool sleepBlocked() {
+  return digitalRead(PIN_ACC) == ACC_ON_LEVEL || apActive || usbHostConnected();
+}
+
+static void resumeAfterSleepCancelled() {
+  if (safeMode) return;
+  for (int i = 0; i < 2; i++) {
+    if (busCtx[i].node && twai_node_enable(busCtx[i].node) != ESP_OK)
+      errLog("CAN%d: resume after cancelled sleep failed", i);
+    bothActiveMark[i] = busCtx[i].rxCount;
+  }
+}
+
+static void goToSleepUntilAccOn() {
+  if (sleepBlocked()) return;
+  // C5 uses EXT1, not the S3 example's EXT0 API. The external pull-up
+  // keeps GPIO0 defined while the digital domain is powered down.
+  esp_err_t e = esp_sleep_enable_ext1_wakeup_io(
+      1ULL << PIN_ACC, ESP_EXT1_WAKEUP_ANY_LOW);
+  if (e != ESP_OK) {
+    errLog("ACC wake configuration failed: %s", esp_err_to_name(e));
+    return;  // never sleep without a working ACC wake source
+  }
+  int stopped = 0;
+  for (int i = 0; i < 2; i++) {
+    if (safeMode || !busCtx[i].node) continue;
+    e = twai_node_disable(busCtx[i].node);
+    if (e != ESP_OK) {
+      errLog("CAN%d: stop before sleep failed: %s", i, esp_err_to_name(e));
+      for (int j = 0; j < i; j++)
+        if (stopped & (1 << j)) twai_node_enable(busCtx[j].node);
+      return;
+    }
+    stopped |= 1 << i;
+  }
+  // Producers are stopped: drain a finite queue, finish the compressor.
+  if (logFile && !paused && sdReady) dispatch();
+  else drainToDummy();
+  closeLogFile(3);  // existing shutdown reason, compatible with unpacker
+  // SD finalisation can take time: check again before committing to sleep.
+  if (sleepBlocked()) { resumeAfterSleepCancelled(); return; }
+  server.stop();
+  WiFi.mode(WIFI_OFF);
+  if (sdReady) { SD.end(); sdReady = false; }
+  Serial.println("ACC OFF: deep sleep; wake on GPIO0 LOW (ACC ON)");
+  delay(20);
+  // A host/ACC arriving during teardown requires full peripheral init.
+  if (sleepBlocked()) { ESP.restart(); return; }
+  esp_deep_sleep_start();
+}
+
+static void sleepLoop() {
+  static bool timing = false;
+  static uint32_t since = 0;
+  if (sleepBlocked()) { timing = false; return; }
+  if (!timing) { timing = true; since = millis(); }
+  if ((uint32_t)(millis() - since) >= SLEEP_GRACE_MS) {
+    goToSleepUntilAccOn();
+    timing = false;  // back off if sleep was cancelled or failed
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10);
   Serial.println("\n=== dual_can_fd_sniffer 0.1.0 ===");
   pinMode(PIN_BOOT, INPUT_PULLUP);
+  pinMode(PIN_ACC, INPUT_PULLUP);
   
   loadUiLanguage();
   loadConfig();
@@ -829,7 +903,7 @@ apActive = apOk;
 
 void loop() {
   pollBootButton();
-  if (safeMode) { delay(100); return; }
+  if (safeMode) { sleepLoop(); delay(100); return; }
   server.handleClient();
 
   if (apActive) {
@@ -848,6 +922,8 @@ void loop() {
     }
   }
 
+  // Run before all logging early returns, including absent SD / silent CAN.
+  sleepLoop();
   if (!sdReady || paused) { drainToDummy(); delay(20); return; }
   if (!logFile) {
     if (!bothBusesActive()) { drainToDummy(); delay(30); return; }

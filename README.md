@@ -41,6 +41,28 @@ The device is a **passive sniffer-logger**: both CAN controllers run in listen-o
 
 [English diagram](docs/Scheme%20Dual%20channels%20CAN-Sniffer%20ESP32-C5%20based%20EN.png) · [Russian diagram](docs/Scheme%20Dual%20channels%20CAN-Sniffer%20ESP32-C5%20based%20RUS.png)
 
+## ACC ignition input, PC817 and sleep
+
+![ACC input through PC817](docs/acc_pc817_en.svg)
+
+| PC817 connection | Signal |
+|---|---|
+| 1 — anode | ACC +12 V through 4.7 kohm, 0.25 W resistor |
+| 2 — cathode | Vehicle ground |
+| 4 — collector | **GPIO0**, external **10 kohm pull-up to ESP32 3V3** |
+| 3 — emitter | ESP32 GND |
+
+Fit a reverse diode across the PC817 LED: cathode to pin 1, anode to pin 2. GPIO0 receives a 3.3 V logic signal only. The external pull-up must remain powered during sleep.
+
+- ACC on: GPIO0 = LOW; sleep is blocked.
+- ACC off: GPIO0 = HIGH. Sleep is allowed only after the portal is off and no USB host has been detected for **5 seconds**.
+- **An enabled portal access point blocks sleep even without clients**. The existing AP policy remains: off after 5 minutes without a client, or after the client disconnects.
+- Native USB Serial/JTAG host activity blocks sleep even with Serial Monitor closed. A charger or power-only cable cannot be distinguished from other power sources in software; detecting any USB power requires a separate VBUS sense input.
+- Before sleep, both CAN controllers stop, the open log's queued frames are drained, compression finishes, the file closes and SD is unmounted. Sleep also works with missing SD or silent CAN buses.
+- GPIO0 LOW (ACC on) wakes the device, restarting `setup()` and the portal. Press RESET when connecting USB to an already sleeping device; USB is not configured as a wake source.
+
+Sleep powers down the ESP32 and radio, but does not disconnect the SD/DC–DC or transceiver supplies. S and VIO remain wired to 3V3 as in the main diagram. Keep the device powered after ACC goes off so that it can finish the log.
+
 ## Hardware and connections
 
 - ESP32-C5 Mini; PSRAM is not required.
