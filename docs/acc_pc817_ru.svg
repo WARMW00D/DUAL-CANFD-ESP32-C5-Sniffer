@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520">
+ <rect width="1100" height="520" fill="#fff"/><g font-family="DejaVu Sans,sans-serif" fill="#172d42"><text x="40" y="45" font-size="25" font-weight="bold">ACC → PC817 → GPIO0 — ESP32-C5 Mini</text>
+ <text x="40" y="90" font-size="17">ACC включено: GPIO0 LOW • ACC выключено: GPIO0 HIGH</text>
+ <rect x="410" y="155" width="250" height="220" rx="12" fill="#eef5fb" stroke="#172d42" stroke-width="2"/>
+ <text x="490" y="190" font-size="22">PC817</text><path d="M535 210V355" stroke="#91a3b0" stroke-dasharray="6 5"/>
+ <g fill="none" stroke="#172d42" stroke-width="3"><path d="M40 235H140M220 235H410M660 235H1010M825 235V200M825 150V125H1010M410 325H90V380M660 325H825V380"/>
+ <rect x="140" y="225" width="80" height="20" fill="white"/><rect x="815" y="150" width="20" height="50" fill="white"/>
+ <path d="M90 380H90M70 380H110M77 389H103M85 398H95M805 380H845M812 389H838M820 398H830"/>
+ <path d="M360 235V325M348 270H372M350 290L360 270L370 290Z"/>
+ </g>
+ <text x="40" y="218" font-size="18">ACC +12 V</text><text x="142" y="210" font-size="17">4.7 kΩ</text><text x="140" y="270" font-size="15">0.25 W</text>
+ <text x="395" y="225" font-size="16">1</text><text x="395" y="350" font-size="16">2</text><text x="650" y="225" font-size="16">4</text><text x="650" y="350" font-size="16">3</text>
+ <text x="440" y="240" font-size="16">Anode</text><text x="430" y="330" font-size="16">Cathode</text><text x="550" y="240" font-size="16">Collector</text><text x="550" y="330" font-size="16">Emitter</text>
+ <text x="850" y="185" font-size="17">10 kΩ</text><text x="855" y="270" font-size="23" font-weight="bold">GPIO0</text><text x="790" y="110" font-size="16">Постоянное питание 3V3 ESP32</text>
+ <text x="45" y="430" font-size="17">Масса автомобиля</text><text x="755" y="430" font-size="17">ESP32 GND</text><text x="250" y="315" font-size="14">1N4148</text>
+ <text x="40" y="485" font-size="16">1N4148: K → PC817 pin 1, A → pin 2. GPIO0: 3.3 V logic only.</text></g></svg>
