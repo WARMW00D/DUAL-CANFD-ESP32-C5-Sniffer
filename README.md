@@ -137,7 +137,7 @@ At startup, the firmware reads the PCF8563 if it is present and its time is vali
 Files are stored as **`/YYYY-MM-DD/can_NNNN.hs`**. Both channels share one file; every frame includes its channel index, timestamp, identifier, length, flags and payload. The decompressed stream starts with a `C5CAN` header.
 
 - A file opens when any enabled channel becomes active; traffic on the other channel is not required.
-- Rotation occurs at **10 MiB of uncompressed binary data**, not 10 MiB on the card.
+- Rotation occurs when the **compressed file on the SD card reaches 10 MiB**. The final file may slightly exceed this threshold because the current block and compressor must be finished.
 - A file closes after **10 seconds without received traffic**. Opening the next file requires new activity on any enabled channel.
 - Time anchors are added every **60 seconds**.
 - The write buffer is submitted to the compressor about every **500 ms**, or when full; this does not guarantee recovery of all recent data after sudden power loss.
@@ -186,7 +186,7 @@ Log compression uses **heatshrink 0.4.1**, a third-party LZSS library whose enco
 - Upstream project: [atomicobject/heatshrink](https://github.com/atomicobject/heatshrink).
 - heatshrink has its own **ISC license**; retain the upstream copyright and permission notice when redistributing its sources. See the [upstream license](https://github.com/atomicobject/heatshrink/blob/master/LICENSE).
 
-## CAN FD update — firmware 0.2.1
+## CAN FD update — firmware 0.2.2
 
 The portal displays each controller's mode, nominal/data bitrates and startup failure. Invalid values are rejected before saving. Previous settings migrate automatically; new settings for both channels use one NVS blob. Startup failures are reported in `errors.log`; the firmware does not silently substitute another bitrate.
 

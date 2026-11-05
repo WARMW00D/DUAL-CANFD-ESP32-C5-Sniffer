@@ -143,7 +143,7 @@ void errLog(const char* fmt, ...) {
   struct tm tm; gmtime_r(&t, &tm);
   char ts[24];
   snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-  String line = String(ts) + " [fw 0.2.1, " + String(millis()) + " ms] " + msg + "\r\n";
+  String line = String(ts) + " [fw 0.2.2, " + String(millis()) + " ms] " + msg + "\r\n";
   Serial.print("[ERR] " + line);
   if (!errMutex) errMutex = xSemaphoreCreateMutex();
   if (xSemaphoreTake(errMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -380,7 +380,7 @@ static bool openLogFile() {
   if (!logFile) return false;
   curLogPath = path; fileFrames = 0; fileBytes = 0;
   uint8_t hdr[58]; memset(hdr, 0, sizeof(hdr));
-  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.2.1\0\0\0\0\0\0\0", 12); hdr[21] = 2;
+  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.2.2\0\0\0\0\0\0\0", 12); hdr[21] = 2;
   for (int i = 0; i < 2; i++) {
     int off = 22 + i * 14; hdr[off] = i; uint16_t br = busCfg[i].bitrate / 1000;
     hdr[off+1] = br & 0xFF; hdr[off+2] = (br >> 8) & 0xFF;
@@ -972,7 +972,7 @@ static void sleepLoop() {
 void setup() {
   Serial.begin(115200);
   uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10);
-  Serial.println("\n=== dual_can_fd_sniffer 0.2.1 ===");
+  Serial.println("\n=== dual_can_fd_sniffer 0.2.2 ===");
   pinMode(PIN_BOOT, INPUT_PULLUP);
   pinMode(PIN_ACC, INPUT_PULLUP);
   
@@ -1063,7 +1063,8 @@ void loop() {
 
   dispatch();
 
-  if (hsLog.totalBytes >= LOG_FILE_MAX) {
+  // fileBytes is the compressed file size, refreshed by flushToSd().
+  if (logFile && fileBytes >= LOG_FILE_MAX) {
     for (int i = 0; i < 2; i++) activityMark[i] = busCtx[i].rxCount;
     closeLogFile(1);
   }
