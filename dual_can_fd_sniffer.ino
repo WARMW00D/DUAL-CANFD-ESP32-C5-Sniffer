@@ -143,7 +143,7 @@ void errLog(const char* fmt, ...) {
   struct tm tm; gmtime_r(&t, &tm);
   char ts[24];
   snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-  String line = String(ts) + " [fw 0.2.0, " + String(millis()) + " ms] " + msg + "\r\n";
+  String line = String(ts) + " [fw 0.2.1, " + String(millis()) + " ms] " + msg + "\r\n";
   Serial.print("[ERR] " + line);
   if (!errMutex) errMutex = xSemaphoreCreateMutex();
   if (xSemaphoreTake(errMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -157,16 +157,18 @@ static const uint32_t NOMINAL_RATES[] = {100000, 125000, 250000, 500000, 800000,
 static const uint32_t DATA_RATES[] = {100000, 125000, 250000, 500000, 800000, 1000000,
                                      2000000, 4000000, 5000000, 8000000};
 
-template<size_t N>
-static bool rateAllowed(uint32_t rate, const uint32_t (&rates)[N]) {
-  for (uint32_t r : rates) if (r == rate) return true;
+static bool rateAllowed(uint32_t rate, bool dataPhase) {
+  const uint32_t* rates = dataPhase ? DATA_RATES : NOMINAL_RATES;
+  size_t count = dataPhase ? sizeof(DATA_RATES) / sizeof(DATA_RATES[0])
+                          : sizeof(NOMINAL_RATES) / sizeof(NOMINAL_RATES[0]);
+  for (size_t i = 0; i < count; i++) if (rates[i] == rate) return true;
   return false;
 }
 
 static bool validBusConfig(const BusConfig& c) {
-  return rateAllowed(c.bitrate, NOMINAL_RATES) && c.fd_mode <= 1 &&
+  return rateAllowed(c.bitrate, false) && c.fd_mode <= 1 &&
          (c.fd_mode == 0 ? c.data_bitrate == 0 :
-          rateAllowed(c.data_bitrate, DATA_RATES) && c.data_bitrate >= c.bitrate);
+          rateAllowed(c.data_bitrate, true) && c.data_bitrate >= c.bitrate);
 }
 
 static BusConfig defaultBusConfig(int i) {
@@ -378,7 +380,7 @@ static bool openLogFile() {
   if (!logFile) return false;
   curLogPath = path; fileFrames = 0; fileBytes = 0;
   uint8_t hdr[58]; memset(hdr, 0, sizeof(hdr));
-  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.2.0\0\0\0\0\0\0\0", 12); hdr[21] = 2;
+  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.2.1\0\0\0\0\0\0\0", 12); hdr[21] = 2;
   for (int i = 0; i < 2; i++) {
     int off = 22 + i * 14; hdr[off] = i; uint16_t br = busCfg[i].bitrate / 1000;
     hdr[off+1] = br & 0xFF; hdr[off+2] = (br >> 8) & 0xFF;
@@ -631,9 +633,11 @@ void handleConfigPage() {
   server.send(200, "text/html; charset=utf-8", html);
 }
 
-template<size_t N>
-static uint32_t parseRate(const String& text, const uint32_t (&rates)[N]) {
-  for (uint32_t r : rates) if (text == String(r)) return r;
+static uint32_t parseRate(const String& text, bool dataPhase) {
+  const uint32_t* rates = dataPhase ? DATA_RATES : NOMINAL_RATES;
+  size_t count = dataPhase ? sizeof(DATA_RATES) / sizeof(DATA_RATES[0])
+                          : sizeof(NOMINAL_RATES) / sizeof(NOMINAL_RATES[0]);
+  for (size_t i = 0; i < count; i++) if (text == String(rates[i])) return rates[i];
   return 0;
 }
 
@@ -653,8 +657,8 @@ void handleConfigSave() {
       server.send(400, "text/plain; charset=utf-8", TR("Неверный режим CAN", "Invalid CAN mode")); return;
     }
     next[i].fd_mode = mode == "1";
-    next[i].bitrate = parseRate(server.arg(p + "_bitrate"), NOMINAL_RATES);
-    next[i].data_bitrate = next[i].fd_mode ? parseRate(server.arg(p + "_data"), DATA_RATES) : 0;
+    next[i].bitrate = parseRate(server.arg(p + "_bitrate"), false);
+    next[i].data_bitrate = next[i].fd_mode ? parseRate(server.arg(p + "_data"), true) : 0;
     if (!validBusConfig(next[i])) {
       server.send(400, "text/plain; charset=utf-8", TR("Неверная скорость: данные FD должны быть не медленнее номинальной скорости", "Invalid bitrate: FD data bitrate must be at least the nominal bitrate")); return;
     }
@@ -968,7 +972,7 @@ static void sleepLoop() {
 void setup() {
   Serial.begin(115200);
   uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10);
-  Serial.println("\n=== dual_can_fd_sniffer 0.2.0 ===");
+  Serial.println("\n=== dual_can_fd_sniffer 0.2.1 ===");
   pinMode(PIN_BOOT, INPUT_PULLUP);
   pinMode(PIN_ACC, INPUT_PULLUP);
   

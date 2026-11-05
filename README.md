@@ -186,7 +186,7 @@ Log compression uses **heatshrink 0.4.1**, a third-party LZSS library whose enco
 - Upstream project: [atomicobject/heatshrink](https://github.com/atomicobject/heatshrink).
 - heatshrink has its own **ISC license**; retain the upstream copyright and permission notice when redistributing its sources. See the [upstream license](https://github.com/atomicobject/heatshrink/blob/master/LICENSE).
 
-## CAN FD update — firmware 0.2.0
+## CAN FD update — firmware 0.2.1
 
 The portal displays each controller's mode, nominal/data bitrates and startup failure. Invalid values are rejected before saving. Previous settings migrate automatically; new settings for both channels use one NVS blob. Startup failures are reported in `errors.log`; the firmware does not silently substitute another bitrate.
 
