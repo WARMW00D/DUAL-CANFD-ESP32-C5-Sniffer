@@ -109,6 +109,22 @@ static uint32_t bootDownMs = 0;
 static SemaphoreHandle_t errMutex = nullptr;
 static uint32_t activityMark[2] = {0, 0};   // для ожидания новой активности
 
+// SD benchmark runs in small steps from loop(), keeping HTTP responsive.
+struct SdTestState {
+  bool running = false;
+  uint8_t stage = 0;  // 0 idle, 1 write, 2 verify, 3 log simulation, 4 done, 5 error
+  String path, error;
+  File file;
+  uint32_t started = 0, stageStart = 0, nextWrite = 0, lastFlush = 0;
+  uint32_t index = 0, written = 0, read = 0, simulated = 0;
+  uint32_t writeMs = 0, readMs = 0, simMs = 0;
+  uint32_t maxWriteUs = 0, slowWrites = 0, badWords = 0;
+  uint32_t maxSimWriteUs = 0, maxFlushUs = 0, failures = 0;
+};
+static SdTestState sdTest;
+static uint32_t sdTestBuf[1024];
+static const uint32_t SD_TEST_BYTES = 4UL * 1024UL * 1024UL;
+
 // ---------- Язык ----------
 #define TR(ru, en) String(uiEn ? (en) : (ru))
 void loadUiLanguage() {
@@ -143,7 +159,7 @@ void errLog(const char* fmt, ...) {
   struct tm tm; gmtime_r(&t, &tm);
   char ts[24];
   snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-  String line = String(ts) + " [fw 0.2.2, " + String(millis()) + " ms] " + msg + "\r\n";
+  String line = String(ts) + " [fw 0.2.3, " + String(millis()) + " ms] " + msg + "\r\n";
   Serial.print("[ERR] " + line);
   if (!errMutex) errMutex = xSemaphoreCreateMutex();
   if (xSemaphoreTake(errMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -380,7 +396,7 @@ static bool openLogFile() {
   if (!logFile) return false;
   curLogPath = path; fileFrames = 0; fileBytes = 0;
   uint8_t hdr[58]; memset(hdr, 0, sizeof(hdr));
-  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.2.2\0\0\0\0\0\0\0", 12); hdr[21] = 2;
+  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.2.3\0\0\0\0\0\0\0", 12); hdr[21] = 2;
   for (int i = 0; i < 2; i++) {
     int off = 22 + i * 14; hdr[off] = i; uint16_t br = busCfg[i].bitrate / 1000;
     hdr[off+1] = br & 0xFF; hdr[off+2] = (br >> 8) & 0xFF;
@@ -520,7 +536,7 @@ String htmlHead(const String& title) {
 void handleSetLang() {
   saveUiLanguage(server.arg("lang") == "en");
   String back = server.arg("back");
-  if (back != "/logs" && back != "/errors" && back != "/config") back = "/";
+  if (back != "/logs" && back != "/errors" && back != "/config" && back != "/sd-test") back = "/";
   server.sendHeader("Location", back); server.send(303);
 }
 
@@ -532,6 +548,7 @@ bool isValidDateFolder(const String& name) {
 }
 
 void handleDeleteDay() {
+  if (sdTest.running) { server.send(409, "text/plain", "SD test running; wait until completion"); return; }
   String body = server.arg("date");
   body.trim();
   if (!isValidDateFolder(body)) { server.send(400, "text/plain", "bad date"); return; }
@@ -582,7 +599,8 @@ void handleRoot() {
     "<li>" + TR("Принято CAN1", "RX CAN1") + ": " + String((uint32_t)busCtx[1].rxCount) + " (drop " + String((uint32_t)busCtx[1].dropCount) + ")</li>"
     + busStatus + "</ul><p><a href='/config'>" + TR("Настройки шин", "Bus settings") + "</a></p>"
     "<p><a href='/logs'>" + TR("Логи на карте", "Logs on card") + "</a></p>"
-    "<p><a href='/errors'>" + TR("Журнал ошибок", "Error log") + "</a></p></body></html>";
+    "<p><a href='/errors'>" + TR("Журнал ошибок", "Error log") + "</a></p>"
+    "<p><a href='/sd-test'>" + TR("Тест SD-карты", "SD card test") + "</a></p></body></html>";
   server.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -642,6 +660,7 @@ static uint32_t parseRate(const String& text, bool dataPhase) {
 }
 
 void handleConfigSave() {
+  if (sdTest.running) { server.send(409, "text/plain", "SD test running; wait until completion"); return; }
   BusConfig next[2]{};
   for (int i = 0; i < 2; i++) {
     String p = String("b") + String(i);
@@ -669,6 +688,148 @@ void handleConfigSave() {
   memcpy(busCfg, next, sizeof(busCfg));
   server.send(200, "text/plain; charset=utf-8", TR("Сохранено, перезагрузка...", "Saved, rebooting..."));
   delay(500); ESP.restart();
+}
+
+// ---------- Тест качества SD: алгоритм c5_test_sd_spi, только 20 МГц ----------
+static uint32_t sdPatternWord(uint32_t i) { return i * 2654435761u ^ (i >> 7); }
+
+static void sdTestFinish(const String& error) {
+  sdTest.file.close();
+  if (sdTest.path.length() && SD.exists(sdTest.path.c_str()) && !SD.remove(sdTest.path.c_str())) {
+    sdTest.error = TR("Не удалось удалить временный файл: ", "Cannot remove temporary file: ") + sdTest.path;
+  }
+  if (error.length()) sdTest.error = error;
+  sdTest.stage = sdTest.error.length() ? 5 : 4;
+  sdTest.running = false;
+  drainToDummy();
+  for (int i = 0; i < 2; i++) activityMark[i] = busCtx[i].rxCount;
+  // Keep the normal portal pause. loop() resumes recording after disconnect.
+}
+
+static void sdTestFlush() {
+  uint32_t t = micros();
+  sdTest.file.flush();
+  uint32_t dt = micros() - t;
+  if (dt > sdTest.maxFlushUs) sdTest.maxFlushUs = dt;
+}
+
+static void sdTestStep() {
+  if (!sdTest.running) return;
+  if (sdTest.stage == 1) {
+    for (size_t k = 0; k < 1024; k++) sdTestBuf[k] = sdPatternWord(sdTest.index++);
+    uint32_t t = micros();
+    size_t n = sdTest.file.write((uint8_t*)sdTestBuf, sizeof(sdTestBuf));
+    uint32_t dt = micros() - t;
+    if (dt > sdTest.maxWriteUs) sdTest.maxWriteUs = dt;
+    if (dt > 50000) sdTest.slowWrites++;
+    sdTest.written += n;
+    if (n != sizeof(sdTestBuf) || sdTest.file.getWriteError()) {
+      sdTest.failures++; sdTestFinish(TR("Ошибка записи 4 КБ", "4 KB write failed")); return;
+    }
+    if (sdTest.written >= SD_TEST_BYTES) {
+      sdTestFlush();
+      bool failed = sdTest.file.getWriteError();
+      sdTest.file.close();
+      sdTest.writeMs = millis() - sdTest.stageStart;
+      if (failed) { sdTest.failures++; sdTestFinish(TR("Ошибка flush", "Flush failed")); return; }
+      sdTest.file = SD.open(sdTest.path.c_str(), FILE_READ);
+      if (!sdTest.file) { sdTestFinish(TR("Ошибка открытия для чтения", "Cannot open for reading")); return; }
+      sdTest.stage = 2; sdTest.index = 0; sdTest.stageStart = millis();
+    }
+  } else if (sdTest.stage == 2) {
+    int n = sdTest.file.read((uint8_t*)sdTestBuf, sizeof(sdTestBuf));
+    if (n != (int)sizeof(sdTestBuf)) { sdTest.failures++; sdTestFinish(TR("Короткое чтение", "Short read")); return; }
+    sdTest.read += n;
+    for (size_t k = 0; k < 1024; k++)
+      if (sdTestBuf[k] != sdPatternWord(sdTest.index++)) sdTest.badWords++;
+    if (sdTest.read >= SD_TEST_BYTES) {
+      sdTest.readMs = millis() - sdTest.stageStart;
+      sdTest.file.close();
+      if (!SD.remove(sdTest.path.c_str())) { sdTestFinish(TR("Не удалось удалить тестовый файл", "Cannot delete test file")); return; }
+      sdTest.file = SD.open(sdTest.path.c_str(), FILE_WRITE);
+      if (!sdTest.file) { sdTestFinish(TR("Ошибка открытия имитации лога", "Cannot open log simulation")); return; }
+      sdTest.stage = 3; sdTest.stageStart = millis();
+      sdTest.lastFlush = sdTest.nextWrite = sdTest.stageStart;
+    }
+  } else if (sdTest.stage == 3) {
+    uint32_t now = millis();
+    if ((uint32_t)(now - sdTest.stageStart) >= 20000UL) {
+      sdTestFlush(); sdTest.simMs = millis() - sdTest.stageStart;
+      if (sdTest.file.getWriteError()) sdTest.failures++;
+      sdTestFinish(String()); return;
+    }
+    if ((int32_t)(now - sdTest.nextWrite) < 0) return;
+    for (size_t k = 0; k < 256; k++) sdTestBuf[k] = sdPatternWord(sdTest.index++);
+    uint32_t t = micros();
+    size_t n = sdTest.file.write((uint8_t*)sdTestBuf, 1024);
+    uint32_t dt = micros() - t;
+    if (dt > sdTest.maxSimWriteUs) sdTest.maxSimWriteUs = dt;
+    sdTest.simulated += n;
+    if (n != 1024 || sdTest.file.getWriteError()) {
+      sdTest.failures++; sdTestFinish(TR("Ошибка имитации лога", "Log simulation write failed")); return;
+    }
+    if ((uint32_t)(millis() - sdTest.lastFlush) >= 1000) {
+      sdTestFlush(); sdTest.lastFlush = millis();
+      if (sdTest.file.getWriteError()) { sdTest.failures++; sdTestFinish(TR("Ошибка flush", "Flush failed")); return; }
+    }
+    sdTest.nextWrite = millis() + 5;
+  }
+}
+
+void handleSdTestStart() {
+  if (sdTest.running) { server.send(409, "text/plain", "Test already running"); return; }
+  if (!sdReady || safeMode) { server.send(503, "text/plain", "SD unavailable"); return; }
+  // Close the log before any benchmark writes, even on the first HTTP request.
+  hadClient = true;
+  paused = true; closeLogFile(3); drainToDummy();
+  if (SD.totalBytes() < SD.usedBytes() || SD.totalBytes() - SD.usedBytes() < 5UL * 1024UL * 1024UL) {
+    server.send(507, "text/plain; charset=utf-8", TR("Нужно минимум 5 МиБ свободного места", "At least 5 MiB free space required")); return;
+  }
+  sdTest = SdTestState();
+  // Never overwrite an existing user file (including leftovers after a reset).
+  for (unsigned i = 0; i < 1000; i++) {
+    String path = String("/c5_sdtest_") + String(i) + ".tmp";
+    if (!SD.exists(path.c_str())) { sdTest.path = path; break; }
+  }
+  if (!sdTest.path.length()) { server.send(409, "text/plain", "No free temporary filename"); return; }
+  sdTest.file = SD.open(sdTest.path.c_str(), FILE_WRITE);
+  if (!sdTest.file) { sdTest.stage = 5; sdTest.error = TR("Не удалось создать файл", "Cannot create test file"); }
+  else { sdTest.running = true; sdTest.stage = 1; sdTest.started = sdTest.stageStart = millis(); }
+  server.sendHeader("Location", "/sd-test"); server.send(303);
+}
+
+void handleSdTestPage() {
+  String html = htmlHead(TR("Тест SD-карты", "SD card test"));
+  html += "<h2>" + TR("Тест SD-карты", "SD card test") + "</h2><p><a href='/'>" + TR("На главную", "Home") + "</a></p>"
+    "<p>SPI: <b>20 MHz</b>. " + TR("Запись/проверка 4 МиБ блоками 4 КБ, затем 20 секунд имитации лога: 1 КБ, пауза 5 мс, flush раз в секунду.",
+                                    "Write/verify 4 MiB in 4 KB blocks, then 20 seconds of log simulation: 1 KB, 5 ms pause, flush every second.") + "</p>"
+    "<p>" + TR("Запись CAN приостановлена на время теста и подключения к порталу. Проверка использует отдельный временный файл; существующие логи не изменяются.",
+                 "CAN logging is paused during the test and portal connection. A separate temporary file is used; existing logs are unchanged.") + "</p>";
+  if (sdReady) html += "<p>" + TR("Размер карты", "Card size") + ": " + String((uint32_t)(SD.cardSize() / (1024ULL * 1024ULL))) + " MiB; " +
+    TR("занято", "used") + ": " + String((uint32_t)(SD.usedBytes() / (1024ULL * 1024ULL))) + " MiB</p>";
+  String status;
+  if (sdTest.stage == 0) status = TR("Не запускался", "Not started");
+  else if (sdTest.stage == 1) status = TR("Запись 4 МиБ", "Writing 4 MiB");
+  else if (sdTest.stage == 2) status = TR("Чтение и проверка", "Reading and verifying");
+  else if (sdTest.stage == 3) status = TR("Имитация лога", "Log simulation");
+  else if (sdTest.stage == 5) status = TR("Тест прерван: ", "Test stopped: ") + htmlEscape(sdTest.error);
+  else status = (sdTest.failures || sdTest.badWords) ? TR("Обнаружены ошибки", "Errors detected") : TR("Тест завершён без ошибок", "Test completed without errors");
+  html += "<h3>" + status + "</h3><ul>";
+  html += "<li>" + TR("Записано / прочитано", "Written / read") + ": " + String(sdTest.written / 1024) + " / " + String(sdTest.read / 1024) + " KiB</li>";
+  if (sdTest.writeMs) html += "<li>" + TR("Скорость записи", "Write speed") + ": " + String((uint32_t)((uint64_t)sdTest.written * 1000 / 1024 / sdTest.writeMs)) + " KiB/s</li>";
+  if (sdTest.readMs) html += "<li>" + TR("Скорость чтения", "Read speed") + ": " + String((uint32_t)((uint64_t)sdTest.read * 1000 / 1024 / sdTest.readMs)) + " KiB/s</li>";
+  html += "<li>" + TR("Макс. запись 4 КБ", "Max 4 KB write") + ": " + String(sdTest.maxWriteUs) + " us</li>"
+    "<li>" + TR("Записей дольше 50 мс", "Writes longer than 50 ms") + ": " + String(sdTest.slowWrites) + "</li>"
+    "<li>" + TR("Ошибок данных (32-битных слов)", "Data errors (32-bit words)") + ": " + String(sdTest.badWords) + "</li>"
+    "<li>" + TR("Сбоев ввода/вывода", "I/O failures") + ": " + String(sdTest.failures) + "</li>"
+    "<li>" + TR("Имитация лога", "Log simulation") + ": " + String(sdTest.simulated / 1024) + " KiB</li>"
+    "<li>" + TR("Макс. запись 1 КБ", "Max 1 KB write") + ": " + String(sdTest.maxSimWriteUs) + " us</li>"
+    "<li>" + TR("Макс. flush (все этапы)", "Max flush (all stages)") + ": " + String(sdTest.maxFlushUs) + " us</li></ul>";
+  if (sdTest.running) html += "<p>" + TR("Можно оставить страницу открытой — результаты обновляются автоматически.", "Keep this page open; results refresh automatically.") + "</p><script>setTimeout(()=>location.reload(),2000);</script>";
+  else if (sdReady && !safeMode) html += "<form method='POST' action='/sd-test/start'><button>" + TR("Запустить тест", "Run test") + "</button></form>";
+  html += "<p>" + TR("Это проверка скорости, задержек и целостности тестового файла, а не всей ёмкости карты. HTTP-запросы могут снижать измеренную скорость.",
+                     "This checks speed, latency and test-file integrity, not the entire card capacity. HTTP requests can reduce measured throughput.") + "</p></body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
 // ---------- Скачивание (TAR) ----------
@@ -714,6 +875,7 @@ bool dlSendAll(WiFiClient& client, const uint8_t* data, size_t len) {
 }
 
 void handleDownloadTar() {
+  if (sdTest.running) { server.send(409, "text/plain", "SD test running; wait until completion"); return; }
   String date = server.arg("date");
   if (!isValidDateFolder(date) || !SD.exists("/" + date)) {
     server.send(404, "text/plain", "Folder not found"); return;
@@ -776,6 +938,7 @@ void handleDownloadTar() {
 }
 
 void handleDownload() {
+  if (sdTest.running) { server.send(409, "text/plain", "SD test running; wait until completion"); return; }
   String path = server.arg("file");
   if (!path.startsWith("/") || path.indexOf("..") != -1) {
     server.send(400, "text/plain", "Invalid path"); return;
@@ -872,6 +1035,7 @@ void handleErrorsPage() {
 }
 
 void handleDeleteErrors() {
+  if (sdTest.running) { server.send(409, "text/plain", "SD test running; wait until completion"); return; }
   SD.remove(ERRLOG_PATH); SD.remove(ERRLOG_OLD_PATH);
   server.sendHeader("Location", "/errors"); server.send(303);
 }
@@ -884,7 +1048,9 @@ static void initSD() {
 }
 
 static void enterSafeMode() {
-  if (safeMode) return; safeMode = true;
+  if (safeMode) return;
+  if (sdTest.running) sdTestFinish(TR("Остановлен кнопкой BOOT", "Stopped by BOOT"));
+  safeMode = true;
   Serial.println("=== SAFE MODE ===");
   for (int i = 0; i < 2; i++) if (busCtx[i].node) twai_node_disable(busCtx[i].node);
   if (logFile) closeLogFile(3);
@@ -908,7 +1074,7 @@ static bool usbHostConnected() {
 }
 
 static bool sleepBlocked() {
-  return digitalRead(PIN_ACC) == ACC_ON_LEVEL || apActive || usbHostConnected();
+  return digitalRead(PIN_ACC) == ACC_ON_LEVEL || apActive || sdTest.running || usbHostConnected();
 }
 
 static void resumeAfterSleepCancelled() {
@@ -972,7 +1138,7 @@ static void sleepLoop() {
 void setup() {
   Serial.begin(115200);
   uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10);
-  Serial.println("\n=== dual_can_fd_sniffer 0.2.2 ===");
+  Serial.println("\n=== dual_can_fd_sniffer 0.2.3 ===");
   pinMode(PIN_BOOT, INPUT_PULLUP);
   pinMode(PIN_ACC, INPUT_PULLUP);
   
@@ -1018,6 +1184,8 @@ apActive = apOk;
   server.on("/set-lang", HTTP_POST, handleSetLang);
   server.on("/logs", handleLogsPage);
   server.on("/config", handleConfigPage);
+  server.on("/sd-test", handleSdTestPage);
+  server.on("/sd-test/start", HTTP_POST, handleSdTestStart);
   server.on("/api/config", HTTP_POST, handleConfigSave);
   server.on("/api/delete-day", HTTP_POST, handleDeleteDay);
   server.on("/download", handleDownload);
@@ -1047,14 +1215,16 @@ void loop() {
       }
       hadClient = true;
     } else {
-      if (hadClient) { stopAp(); paused = false; }
+      if (sdTest.running) { /* keep portal available until the test completes */ }
+      else if (hadClient) { stopAp(); paused = false; }
       else if (millis() - apStartMs > AP_TIMEOUT_MS) stopAp();
     }
   }
 
   // Run before all logging early returns, including absent SD / silent CAN.
+  sdTestStep();
   sleepLoop();
-  if (!sdReady || paused) { drainToDummy(); delay(20); return; }
+  if (!sdReady || paused) { drainToDummy(); delay(sdTest.running ? 1 : 20); return; }
   if (!logFile) {
     if (!anyBusActive()) { drainToDummy(); delay(30); return; }
     if (!openLogFile()) { drainToDummy(); delay(1000); return; }

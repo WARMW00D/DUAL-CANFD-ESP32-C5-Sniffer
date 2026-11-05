@@ -186,8 +186,22 @@ Log compression uses **heatshrink 0.4.1**, a third-party LZSS library whose enco
 - Upstream project: [atomicobject/heatshrink](https://github.com/atomicobject/heatshrink).
 - heatshrink has its own **ISC license**; retain the upstream copyright and permission notice when redistributing its sources. See the [upstream license](https://github.com/atomicobject/heatshrink/blob/master/LICENSE).
 
-## CAN FD update — firmware 0.2.2
+## CAN FD update — firmware 0.2.3
 
 The portal displays each controller's mode, nominal/data bitrates and startup failure. Invalid values are rejected before saving. Previous settings migrate automatically; new settings for both channels use one NVS blob. Startup failures are reported in `errors.log`; the firmware does not silently substitute another bitrate.
 
 The C5CAN v1 header remains 58 bytes. Each 14-byte bus record stores: +0 bus index, +1..2 nominal kbit/s (LE), +3 mode (0 Classic / 1 FD), +4..5 data kbit/s (LE; 0 for Classic), +6..13 name. Updated `tools/log_unpack.py` reads new and old v1 headers, including single-frame logs, and labels FD frames `[FD]` or `[FD/BRS]`.
+
+## SD card quality test
+
+Open the separate **SD card test** item on the portal home page and press **Run test**. Based on `c5_test_sd_spi.ino`, the test runs only at **20 MHz SPI**:
+
+1. Write 4 MiB in 4 KB blocks using a deterministic pattern.
+2. Read the entire test file and verify every 32-bit word.
+3. Simulate logging for 20 seconds: 1 KB blocks, 5 ms pauses between writes, flush every second.
+
+The page refreshes automatically and displays write/read throughput, maximum 4 KB write latency, writes exceeding 50 ms, data and I/O errors, maximum 1 KB write latency and flush latency. HTTP requests may reduce measured throughput. The test uses the logger's normal SD connection and clock.
+
+At least 5 MiB free space is required. A separate `/c5_sdtest_N.tmp` file is created without overwriting existing files and deleted after the test. A power reset can leave a temporary file behind. This checks speed, latency and test-file integrity, not the entire card capacity or counterfeit capacity.
+
+During the test, CAN logging pauses, sleep is blocked, and file downloads/deletion and configuration saves are blocked. If the client disconnects, the test finishes before normal portal/logging behaviour resumes. BOOT aborts the test and enters safe SD removal mode.
