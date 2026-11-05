@@ -119,12 +119,12 @@ The sketch uses the ESP32 core libraries and the bundled heatshrink sources. PCF
 ## Operation
 
 1. Insert a microSD card with a filesystem supported by the installed ESP32 SD library, and power the device.
-2. Both channels are enabled by default. Recording starts after **each enabled channel has received traffic**. For a single-bus installation, disable the unused channel in the portal.
+2. Both channels are enabled by default. Recording starts after **any enabled channel has received traffic**. For a single-bus installation, disable the unused channel in the portal.
 3. To configure the device or download logs, connect to **`C5-SNIFFER`**, password **`canlogger`**, and open **http://192.168.4.1/**. The actual AP address is also printed in Serial.
 4. Open **Bus settings** to enable channels, assign names (up to 7 characters), and choose nominal bitrates: **100, 125, 250, 500 or 1000 kbit/s**. Saving restarts the device.
 5. Open **Logs on card** to download individual files, download a day as TAR, or delete a date folder. **Error log** displays recorded errors and provides a clear button.
 
-**Connecting a Wi-Fi client pauses recording and closes the current log.** Frames received during the pause are discarded. When the client disconnects, Wi-Fi switches off and recording can resume after fresh traffic has arrived on every enabled channel. Without a client, the AP switches off after **5 minutes**. Reset the device to make the AP available again.
+**Connecting a Wi-Fi client pauses recording and closes the current log.** Frames received during the pause are discarded. When the client disconnects, Wi-Fi switches off and recording can resume after fresh traffic has arrived on any enabled channel. Without a client, the AP switches off after **5 minutes**. Reset the device to make the AP available again.
 
 To remove the card, press and hold **BOOT on the running device** for at least **100 ms**. The firmware disables CAN reception, closes the log, unmounts SD and stops Wi-Fi. Wait for `Card is safe to remove. Press RESET to continue.` in Serial. Press RESET to resume operation.
 
@@ -136,9 +136,9 @@ At startup, the firmware reads the PCF8563 if it is present and its time is vali
 
 Files are stored as **`/YYYY-MM-DD/can_NNNN.hs`**. Both channels share one file; every frame includes its channel index, timestamp, identifier, length, flags and payload. The decompressed stream starts with a `C5CAN` header.
 
-- A file opens only after all enabled channels have become active.
+- A file opens when any enabled channel becomes active; traffic on the other channel is not required.
 - Rotation occurs at **10 MiB of uncompressed binary data**, not 10 MiB on the card.
-- A file closes after **10 seconds without received traffic**. Opening the next file again requires activity on all enabled channels.
+- A file closes after **10 seconds without received traffic**. Opening the next file requires new activity on any enabled channel.
 - Time anchors are added every **60 seconds**.
 - The write buffer is submitted to the compressor about every **500 ms**, or when full; this does not guarantee recovery of all recent data after sudden power loss.
 - The date directory is chosen when a file opens. An already open file is not rotated just because midnight has passed.

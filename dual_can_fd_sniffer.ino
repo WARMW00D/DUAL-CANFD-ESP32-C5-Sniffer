@@ -107,7 +107,7 @@ static bool    safeMode = false;
 static bool    bootArmed = false;
 static uint32_t bootDownMs = 0;
 static SemaphoreHandle_t errMutex = nullptr;
-static uint32_t bothActiveMark[2] = {0, 0};   // для ожидания обеих шин
+static uint32_t activityMark[2] = {0, 0};   // для ожидания новой активности
 
 // ---------- Язык ----------
 #define TR(ru, en) String(uiEn ? (en) : (ru))
@@ -296,13 +296,13 @@ static String fmtDateTime(time_t t) {
 
 static void stopAp() { WiFi.softAPdisconnect(true); WiFi.mode(WIFI_OFF); apActive = false; }
 
-// ---------- Ожидание обеих шин ----------
-static bool bothBusesActive() {
+// ---------- Ожидание любого включённого канала ----------
+static bool anyBusActive() {
   for (int i = 0; i < 2; i++) {
     if (!busCfg[i].enabled) continue;
-    if ((uint32_t)(busCtx[i].rxCount - bothActiveMark[i]) == 0) return false;
+    if ((uint32_t)(busCtx[i].rxCount - activityMark[i]) != 0) return true;
   }
-  return true;
+  return false;
 }
 
 // ---------- Логирование ----------
@@ -490,8 +490,8 @@ void handleRoot() {
   if (!sdReady) state = TR("НЕТ SD", "NO SD");
   else if (paused) state = TR("ПАУЗА (портал)", "PAUSED (portal)");
   else if (logFile) state = TR("ЗАПИСЬ", "LOGGING");
-  else if (bothBusesActive()) state = TR("ОЖИДАНИЕ", "IDLE");
-  else state = TR("ЖДУ ОБЕ ШИНЫ", "WAITING FOR BOTH BUSES");
+  else if (anyBusActive()) state = TR("ОЖИДАНИЕ", "IDLE");
+  else state = TR("ЖДУ CAN", "WAITING FOR CAN");
 
   String html = htmlHead(TR("Сниффер C5", "C5 Sniffer")) +
     "<h2>" + TR("Состояние", "Status") + "</h2><ul>"
@@ -786,7 +786,7 @@ static void resumeAfterSleepCancelled() {
   for (int i = 0; i < 2; i++) {
     if (busCtx[i].node && twai_node_enable(busCtx[i].node) != ESP_OK)
       errLog("CAN%d: resume after cancelled sleep failed", i);
-    bothActiveMark[i] = busCtx[i].rxCount;
+    activityMark[i] = busCtx[i].rxCount;
   }
 }
 
@@ -910,7 +910,7 @@ void loop() {
     int n = WiFi.softAPgetStationNum();
     if (n > 0) {
       if (!paused) {
-        for (int i = 0; i < 2; i++) bothActiveMark[i] = busCtx[i].rxCount;
+        for (int i = 0; i < 2; i++) activityMark[i] = busCtx[i].rxCount;
         closeLogFile(3);
         drainToDummy();
         paused = true;
@@ -926,19 +926,19 @@ void loop() {
   sleepLoop();
   if (!sdReady || paused) { drainToDummy(); delay(20); return; }
   if (!logFile) {
-    if (!bothBusesActive()) { drainToDummy(); delay(30); return; }
+    if (!anyBusActive()) { drainToDummy(); delay(30); return; }
     if (!openLogFile()) { drainToDummy(); delay(1000); return; }
-    for (int i = 0; i < 2; i++) bothActiveMark[i] = busCtx[i].rxCount;
+    for (int i = 0; i < 2; i++) activityMark[i] = busCtx[i].rxCount;
   }
 
   dispatch();
 
   if (hsLog.totalBytes >= LOG_FILE_MAX) {
-    for (int i = 0; i < 2; i++) bothActiveMark[i] = busCtx[i].rxCount;
+    for (int i = 0; i < 2; i++) activityMark[i] = busCtx[i].rxCount;
     closeLogFile(1);
   }
   if (logFile && lastCanActivityMs && millis() - lastCanActivityMs > LOG_IDLE_CLOSE_MS) {
-    for (int i = 0; i < 2; i++) bothActiveMark[i] = busCtx[i].rxCount;
+    for (int i = 0; i < 2; i++) activityMark[i] = busCtx[i].rxCount;
     closeLogFile(2);
   }
   if (logFile && millis() - lastAnchorMs > LOG_ANCHOR_MS) { writeAnchor(); lastAnchorMs = millis(); }
