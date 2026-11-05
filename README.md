@@ -23,7 +23,7 @@ The device is a **passive sniffer-logger**: both CAN controllers run in listen-o
 - Received / dropped frame counters and an error log.
 - BOOT button mode for safe SD-card removal.
 
-**CAN FD status:** the receive path handles FD/BRS flags and payloads up to 64 bytes, and the driver accepts a data-phase bitrate. However, the current defaults are **Classic CAN at 500 kbit/s on both channels**, and the portal only configures the nominal bitrate. CAN FD data-phase settings require a source-code change; there is no CAN FD selector in the current portal. Use transceivers suitable for the intended data rate.
+**CAN FD:** mode and bitrates are configured independently for CAN0 and CAN1 in the portal and saved in NVS. Each channel offers **Classic CAN** or **CAN FD**; nominal rates are **100, 125, 250, 500, 800 or 1000 kbit/s**. FD data rates include the same values plus **2, 4, 5 or 8 Mbit/s**, and must be at least the nominal rate. Defaults remain Classic CAN at 500 kbit/s. FD mode also receives Classic frames; FD frames with BRS use the selected data rate, while frames without BRS use the nominal rate throughout. Logs and the unpacker preserve FD/BRS flags and payloads up to 64 bytes. Transceivers and wiring must support the selected rate; 8 Mbit/s is a selectable setting, not a verified rate on your hardware.
 
 ## Repository layout
 
@@ -121,7 +121,7 @@ The sketch uses the ESP32 core libraries and the bundled heatshrink sources. PCF
 1. Insert a microSD card with a filesystem supported by the installed ESP32 SD library, and power the device.
 2. Both channels are enabled by default. Recording starts after **any enabled channel has received traffic**. For a single-bus installation, disable the unused channel in the portal.
 3. To configure the device or download logs, connect to **`C5-SNIFFER`**, password **`canlogger`**, and open **http://192.168.4.1/**. The actual AP address is also printed in Serial.
-4. Open **Bus settings** to enable channels, assign names (up to 7 characters), and choose nominal bitrates: **100, 125, 250, 500 or 1000 kbit/s**. Saving restarts the device.
+4. Open **Bus settings** to enable channels, assign names (up to 7 bytes), and choose Classic CAN / CAN FD, the nominal bitrate and the FD data bitrate. Saving restarts the device.
 5. Open **Logs on card** to download individual files, download a day as TAR, or delete a date folder. **Error log** displays recorded errors and provides a clear button.
 
 **Connecting a Wi-Fi client pauses recording and closes the current log.** Frames received during the pause are discarded. When the client disconnects, Wi-Fi switches off and recording can resume after fresh traffic has arrived on any enabled channel. Without a client, the AP switches off after **5 minutes**. Reset the device to make the AP available again.
@@ -185,3 +185,9 @@ Log compression uses **heatshrink 0.4.1**, a third-party LZSS library whose enco
 - Author: **Scott Vokes** — [vokes.s@gmail.com](mailto:vokes.s@gmail.com).
 - Upstream project: [atomicobject/heatshrink](https://github.com/atomicobject/heatshrink).
 - heatshrink has its own **ISC license**; retain the upstream copyright and permission notice when redistributing its sources. See the [upstream license](https://github.com/atomicobject/heatshrink/blob/master/LICENSE).
+
+## CAN FD update — firmware 0.2.0
+
+The portal displays each controller's mode, nominal/data bitrates and startup failure. Invalid values are rejected before saving. Previous settings migrate automatically; new settings for both channels use one NVS blob. Startup failures are reported in `errors.log`; the firmware does not silently substitute another bitrate.
+
+The C5CAN v1 header remains 58 bytes. Each 14-byte bus record stores: +0 bus index, +1..2 nominal kbit/s (LE), +3 mode (0 Classic / 1 FD), +4..5 data kbit/s (LE; 0 for Classic), +6..13 name. Updated `tools/log_unpack.py` reads new and old v1 headers, including single-frame logs, and labels FD frames `[FD]` or `[FD/BRS]`.

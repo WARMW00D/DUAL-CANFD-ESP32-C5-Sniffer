@@ -143,7 +143,7 @@ void errLog(const char* fmt, ...) {
   struct tm tm; gmtime_r(&t, &tm);
   char ts[24];
   snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-  String line = String(ts) + " [fw 0.1.0, " + String(millis()) + " ms] " + msg + "\r\n";
+  String line = String(ts) + " [fw 0.2.0, " + String(millis()) + " ms] " + msg + "\r\n";
   Serial.print("[ERR] " + line);
   if (!errMutex) errMutex = xSemaphoreCreateMutex();
   if (xSemaphoreTake(errMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -153,21 +153,60 @@ void errLog(const char* fmt, ...) {
 }
 
 // ---------- Конфигурация ----------
+static const uint32_t NOMINAL_RATES[] = {100000, 125000, 250000, 500000, 800000, 1000000};
+static const uint32_t DATA_RATES[] = {100000, 125000, 250000, 500000, 800000, 1000000,
+                                     2000000, 4000000, 5000000, 8000000};
+
+template<size_t N>
+static bool rateAllowed(uint32_t rate, const uint32_t (&rates)[N]) {
+  for (uint32_t r : rates) if (r == rate) return true;
+  return false;
+}
+
+static bool validBusConfig(const BusConfig& c) {
+  return rateAllowed(c.bitrate, NOMINAL_RATES) && c.fd_mode <= 1 &&
+         (c.fd_mode == 0 ? c.data_bitrate == 0 :
+          rateAllowed(c.data_bitrate, DATA_RATES) && c.data_bitrate >= c.bitrate);
+}
+
+static BusConfig defaultBusConfig(int i) {
+  BusConfig c{};
+  c.enabled = true;
+  snprintf(c.name, sizeof(c.name), "CAN%d", i);
+  c.bitrate = 500000;
+  return c;
+}
+
 void loadConfig() {
-  prefs.begin("can", true);
-  prefs.getBytes("bus0", &busCfg[0], sizeof(BusConfig));
-  prefs.getBytes("bus1", &busCfg[1], sizeof(BusConfig));
+  for (int i = 0; i < 2; i++) busCfg[i] = defaultBusConfig(i);
+  if (!prefs.begin("can", true)) return;
+  // One blob makes subsequent two-bus updates atomic. Migrate old keys.
+  if (prefs.getBytesLength("buses_v2") == sizeof(busCfg)) {
+    prefs.getBytes("buses_v2", busCfg, sizeof(busCfg));
+  } else {
+    for (int i = 0; i < 2; i++) {
+      const char* key = i == 0 ? "bus0" : "bus1";
+      if (prefs.getBytesLength(key) == sizeof(BusConfig))
+        prefs.getBytes(key, &busCfg[i], sizeof(BusConfig));
+    }
+  }
   prefs.end();
-  if (busCfg[0].bitrate == 0) {
-    busCfg[0] = {true, "CAN0", 500000, 0, 0};
-    busCfg[1] = {true, "CAN1", 500000, 0, 0};
+  for (int i = 0; i < 2; i++) {
+    busCfg[i].name[sizeof(busCfg[i].name) - 1] = '\0';
+    if (!busCfg[i].name[0]) snprintf(busCfg[i].name, sizeof(busCfg[i].name), "CAN%d", i);
+    if (busCfg[i].fd_mode == 0) busCfg[i].data_bitrate = 0;
+    if (!validBusConfig(busCfg[i])) {
+      errLog("CAN%d: invalid stored configuration; using Classic 500 kbit/s", i);
+      busCfg[i] = defaultBusConfig(i);
+    }
   }
 }
-void saveConfig() {
-  prefs.begin("can", false);
-  prefs.putBytes("bus0", &busCfg[0], sizeof(BusConfig));
-  prefs.putBytes("bus1", &busCfg[1], sizeof(BusConfig));
+
+static bool saveConfig(const BusConfig* config) {
+  if (!prefs.begin("can", false)) return false;
+  bool ok = prefs.putBytes("buses_v2", config, sizeof(busCfg)) == sizeof(busCfg);
   prefs.end();
+  return ok;
 }
 
 // ---------- timegm ----------
@@ -339,10 +378,13 @@ static bool openLogFile() {
   if (!logFile) return false;
   curLogPath = path; fileFrames = 0; fileBytes = 0;
   uint8_t hdr[58]; memset(hdr, 0, sizeof(hdr));
-  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.1.0\0\0\0\0\0\0\0", 12); hdr[21] = 2;
+  memcpy(hdr, "C5CAN\0\0\0", 8); hdr[8] = 1; memcpy(hdr + 9, "0.2.0\0\0\0\0\0\0\0", 12); hdr[21] = 2;
   for (int i = 0; i < 2; i++) {
     int off = 22 + i * 14; hdr[off] = i; uint16_t br = busCfg[i].bitrate / 1000;
     hdr[off+1] = br & 0xFF; hdr[off+2] = (br >> 8) & 0xFF;
+    hdr[off+3] = busCfg[i].fd_mode;
+    uint16_t dbr = busCfg[i].data_bitrate / 1000;
+    hdr[off+4] = dbr & 0xFF; hdr[off+5] = (dbr >> 8) & 0xFF;
     for (int k = 0; k < 8 && busCfg[i].name[k]; k++) hdr[off+6+k] = busCfg[i].name[k];
   }
   uint32_t us = (uint32_t)esp_timer_get_time(); uint32_t sec = (uint32_t)time(nullptr);
@@ -380,21 +422,29 @@ static void writeAnchor() {
 static bool IRAM_ATTR onRx(twai_node_handle_t h, const twai_rx_done_event_data_t*, void* ctx) {
   BusCtx* b = (BusCtx*)ctx;
   uint32_t head = b->head, next = (head + 1) & 511;
-  if (next == b->tail) { b->dropCount++; return false; }
+  uint8_t discard[64];
+  bool full = next == b->tail;
   twai_frame_t f; memset(&f, 0, sizeof(f));
-  f.buffer = b->ring[head].data; f.buffer_len = 64;
+  f.buffer = full ? discard : b->ring[head].data; f.buffer_len = 64;
   if (twai_node_receive_from_isr(h, &f) != ESP_OK) return false;
+  if (full) { b->dropCount++; return false; }
+  if (f.header.fdf && !busCfg[b->busIndex].fd_mode) return false;
   uint32_t us = (uint32_t)esp_timer_get_time();
   uint8_t busfl = b->busIndex;
-  if (f.header.ide) busfl |= 0x08; if (f.header.rtr) busfl |= 0x10;
-  if (f.header.fdf) busfl |= 0x20; if (f.header.brs) busfl |= 0x40;
+  if (f.header.ide) busfl |= 0x08;
+  if (f.header.rtr) busfl |= 0x10;
+  if (f.header.fdf) busfl |= 0x20;
+  if (f.header.brs) busfl |= 0x40;
   b->ring[head].ts_us = us; b->ring[head].id = f.header.id; b->ring[head].bus_fl = busfl;
   b->ring[head].len = f.header.fdf ? twaifd_dlc2len(f.header.dlc) : (f.header.dlc > 8 ? 8 : f.header.dlc);
   b->head = next; b->rxCount++;
   return false;
 }
 
-static bool startBus(BusCtx* b, uint8_t idx, uint32_t bitrate, uint32_t fd_bitrate) {
+static bool startBus(BusCtx* b, uint8_t idx, const BusConfig& config) {
+  if (!validBusConfig(config)) return false;
+  uint32_t bitrate = config.bitrate;
+  uint32_t fd_bitrate = config.fd_mode ? config.data_bitrate : 0;
   b->busIndex = idx;
   twai_onchip_node_config_t cfg; memset(&cfg, 0, sizeof(cfg));
   cfg.io_cfg.rx = (gpio_num_t)(idx == 0 ? PIN_CAN0_RX : PIN_CAN1_RX);
@@ -403,12 +453,25 @@ static bool startBus(BusCtx* b, uint8_t idx, uint32_t bitrate, uint32_t fd_bitra
   if (fd_bitrate) { cfg.data_timing.bitrate = fd_bitrate; cfg.data_timing.sp_permill = 750; }
   cfg.fail_retry_cnt = 0; cfg.tx_queue_depth = 1; cfg.flags.enable_listen_only = 1;
   esp_err_t e = twai_new_node_onchip(&cfg, &b->node);
-  if (e != ESP_OK) return false;
+  if (e != ESP_OK) {
+    b->node = nullptr;
+    errLog("CAN%d: create failed (%s), mode=%s nominal=%lu data=%lu", idx,
+           esp_err_to_name(e), config.fd_mode ? "FD" : "Classic",
+           (unsigned long)bitrate, (unsigned long)fd_bitrate);
+    return false;
+  }
   twai_event_callbacks_t cb; memset(&cb, 0, sizeof(cb)); cb.on_rx_done = onRx;
   e = twai_node_register_event_callbacks(b->node, &cb, b);
-  if (e != ESP_OK) return false;
-  e = twai_node_enable(b->node);
-  return e == ESP_OK;
+  if (e == ESP_OK) e = twai_node_enable(b->node);
+  if (e != ESP_OK) {
+    errLog("CAN%d: start failed: %s", idx, esp_err_to_name(e));
+    twai_node_delete(b->node); b->node = nullptr;
+    return false;
+  }
+  Serial.printf("CAN%d: %s nominal=%lu data=%lu bit/s, listen-only\n", idx,
+                config.fd_mode ? "FD" : "Classic", (unsigned long)bitrate,
+                (unsigned long)fd_bitrate);
+  return true;
 }
 
 static bool ringHasData() { return busCtx[0].tail != busCtx[0].head || busCtx[1].tail != busCtx[1].head; }
@@ -493,6 +556,18 @@ void handleRoot() {
   else if (anyBusActive()) state = TR("ОЖИДАНИЕ", "IDLE");
   else state = TR("ЖДУ CAN", "WAITING FOR CAN");
 
+  String busStatus;
+  for (int i = 0; i < 2; i++) {
+    const BusConfig& c = busCfg[i];
+    busStatus += "<li>CAN" + String(i) + ": ";
+    if (!c.enabled) busStatus += TR("выключен", "disabled");
+    else {
+      busStatus += String(c.fd_mode ? "CAN FD" : "Classic CAN") + " / " + String(c.bitrate / 1000);
+      if (c.fd_mode) busStatus += " / " + String(c.data_bitrate / 1000);
+      busStatus += " kbit/s — " + (busCtx[i].node ? TR("работает", "running") : TR("ОШИБКА ЗАПУСКА", "START FAILED"));
+    }
+    busStatus += "</li>";
+  }
   String html = htmlHead(TR("Сниффер C5", "C5 Sniffer")) +
     "<h2>" + TR("Состояние", "Status") + "</h2><ul>"
     "<li>" + TR("Состояние", "State") + ": <b>" + state + "</b></li>"
@@ -503,41 +578,92 @@ void handleRoot() {
     "<li>" + TR("Кадров в файле", "Frames in file") + ": " + String(fileFrames) + "</li>"
     "<li>" + TR("Принято CAN0", "RX CAN0") + ": " + String((uint32_t)busCtx[0].rxCount) + " (drop " + String((uint32_t)busCtx[0].dropCount) + ")</li>"
     "<li>" + TR("Принято CAN1", "RX CAN1") + ": " + String((uint32_t)busCtx[1].rxCount) + " (drop " + String((uint32_t)busCtx[1].dropCount) + ")</li>"
-    "</ul><p><a href='/config'>" + TR("Настройки шин", "Bus settings") + "</a></p>"
+    + busStatus + "</ul><p><a href='/config'>" + TR("Настройки шин", "Bus settings") + "</a></p>"
     "<p><a href='/logs'>" + TR("Логи на карте", "Logs on card") + "</a></p>"
     "<p><a href='/errors'>" + TR("Журнал ошибок", "Error log") + "</a></p></body></html>";
   server.send(200, "text/html; charset=utf-8", html);
 }
 
+static String htmlEscape(const String& value) {
+  String out;
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '\'') out += "&#39;";
+    else if (c == '"') out += "&quot;";
+    else out += c;
+  }
+  return out;
+}
+
 void handleConfigPage() {
   String html = htmlHead(TR("Настройки CAN", "CAN Settings")) +
     "<h2>" + TR("Настройки шин", "Bus settings") + "</h2><p><a href='/'>&larr; " + TR("на главную", "home") + "</a></p>"
-    "<form method='POST' action='/api/config'>"
-    "<h3>CAN0</h3>"
-    "<input type='checkbox' name='b0_en' " + String(busCfg[0].enabled ? "checked" : "") + "> " + TR("Включена", "Enabled") + "<br>"
-    "<input type='text' name='b0_name' value='" + String(busCfg[0].name) + "' maxlength='7' placeholder='CAN0'><br>"
-    "<select name='b0_bitrate'>";
-    uint32_t brs[] = {100000, 125000, 250000, 500000, 1000000};
-    for (auto br : brs) html += "<option value='" + String(br) + "'" + (busCfg[0].bitrate == br ? " selected" : "") + ">" + String(br/1000) + " kbit/s</option>";
-    html += "</select><br><br><h3>CAN1</h3>"
-    "<input type='checkbox' name='b1_en' " + String(busCfg[1].enabled ? "checked" : "") + "> " + TR("Включена", "Enabled") + "<br>"
-    "<input type='text' name='b1_name' value='" + String(busCfg[1].name) + "' maxlength='7' placeholder='CAN1'><br>"
-    "<select name='b1_bitrate'>";
-    for (auto br : brs) html += "<option value='" + String(br) + "'" + (busCfg[1].bitrate == br ? " selected" : "") + ">" + String(br/1000) + " kbit/s</option>";
-    html += "</select><br><br>"
-    "<button type='submit'>" + TR("Сохранить и перезагрузить", "Save and reboot") + "</button></form>";
+    "<p>" + TR("CAN FD принимает также Classic CAN. Скорости должны соответствовать шине.",
+                 "CAN FD also receives Classic CAN. Bitrates must match the bus.") + "</p>"
+    "<form method='POST' action='/api/config'>";
+  for (int i = 0; i < 2; i++) {
+    String p = String("b") + String(i);
+    const BusConfig& c = busCfg[i];
+    html += "<fieldset><legend>CAN" + String(i) + "</legend>"
+      "<label><input type='checkbox' name='" + p + "_en' " + String(c.enabled ? "checked" : "") + "> " + TR("Включён", "Enabled") + "</label><br>"
+      "<label>" + TR("Имя", "Name") + " <input name='" + p + "_name' value='" + htmlEscape(String(c.name)) + "' maxlength='7'></label><br>"
+      "<label>" + TR("Режим", "Mode") + " <select name='" + p + "_mode' id='" + p + "_mode' onchange='fdMode(" + String(i) + ")'>"
+      "<option value='0'" + String(c.fd_mode ? "" : " selected") + ">Classic CAN</option>"
+      "<option value='1'" + String(c.fd_mode ? " selected" : "") + ">CAN FD</option></select></label><br>"
+      "<label>" + TR("Номинальная скорость", "Nominal bitrate") + " <select name='" + p + "_bitrate'>";
+    for (uint32_t br : NOMINAL_RATES)
+      html += "<option value='" + String(br) + "'" + String(c.bitrate == br ? " selected" : "") + ">" + String(br / 1000) + " kbit/s</option>";
+    html += "</select></label><br><label id='" + p + "_data_row'>" + TR("Скорость данных FD (BRS)", "FD data bitrate (BRS)") +
+      " <select name='" + p + "_data' id='" + p + "_data'>";
+    uint32_t selected = c.fd_mode ? c.data_bitrate : 2000000;
+    for (uint32_t br : DATA_RATES)
+      html += "<option value='" + String(br) + "'" + String(selected == br ? " selected" : "") + ">" + String(br / 1000) + " kbit/s</option>";
+    html += "</select></label></fieldset><br>";
+  }
+  html += "<p>" + TR("Без BRS весь FD-кадр идёт на номинальной скорости. BRS определяется по принятому кадру автоматически.",
+                      "Without BRS, the entire FD frame uses the nominal bitrate. BRS is detected from each received frame.") + "</p>"
+    "<button type='submit'>" + TR("Сохранить и перезагрузить", "Save and reboot") + "</button></form>"
+    "<script>function fdMode(i){let p='b'+i;let fd=document.getElementById(p+'_mode').value==='1';"
+    "document.getElementById(p+'_data_row').hidden=!fd;document.getElementById(p+'_data').disabled=!fd;}fdMode(0);fdMode(1);</script></body></html>";
   server.send(200, "text/html; charset=utf-8", html);
 }
 
+template<size_t N>
+static uint32_t parseRate(const String& text, const uint32_t (&rates)[N]) {
+  for (uint32_t r : rates) if (text == String(r)) return r;
+  return 0;
+}
+
 void handleConfigSave() {
-  busCfg[0].enabled = server.hasArg("b0_en");
-  strncpy(busCfg[0].name, server.arg("b0_name").c_str(), 7);
-  busCfg[0].bitrate = server.arg("b0_bitrate").toInt();
-  busCfg[1].enabled = server.hasArg("b1_en");
-  strncpy(busCfg[1].name, server.arg("b1_name").c_str(), 7);
-  busCfg[1].bitrate = server.arg("b1_bitrate").toInt();
-  saveConfig();
-  server.send(200, "text/plain", "OK, rebooting...");
+  BusConfig next[2]{};
+  for (int i = 0; i < 2; i++) {
+    String p = String("b") + String(i);
+    next[i].enabled = server.hasArg(p + "_en");
+    String name = server.arg(p + "_name");
+    if (!name.length()) name = String("CAN") + String(i);
+    if (name.length() > 7) {
+      server.send(400, "text/plain; charset=utf-8", TR("Имя: максимум 7 байт", "Name: maximum 7 bytes")); return;
+    }
+    memcpy(next[i].name, name.c_str(), name.length());
+    String mode = server.arg(p + "_mode");
+    if (mode != "0" && mode != "1") {
+      server.send(400, "text/plain; charset=utf-8", TR("Неверный режим CAN", "Invalid CAN mode")); return;
+    }
+    next[i].fd_mode = mode == "1";
+    next[i].bitrate = parseRate(server.arg(p + "_bitrate"), NOMINAL_RATES);
+    next[i].data_bitrate = next[i].fd_mode ? parseRate(server.arg(p + "_data"), DATA_RATES) : 0;
+    if (!validBusConfig(next[i])) {
+      server.send(400, "text/plain; charset=utf-8", TR("Неверная скорость: данные FD должны быть не медленнее номинальной скорости", "Invalid bitrate: FD data bitrate must be at least the nominal bitrate")); return;
+    }
+  }
+  if (!saveConfig(next)) {
+    server.send(500, "text/plain; charset=utf-8", TR("Не удалось сохранить настройки", "Failed to save settings")); return;
+  }
+  memcpy(busCfg, next, sizeof(busCfg));
+  server.send(200, "text/plain; charset=utf-8", TR("Сохранено, перезагрузка...", "Saved, rebooting..."));
   delay(500); ESP.restart();
 }
 
@@ -842,7 +968,7 @@ static void sleepLoop() {
 void setup() {
   Serial.begin(115200);
   uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10);
-  Serial.println("\n=== dual_can_fd_sniffer 0.1.0 ===");
+  Serial.println("\n=== dual_can_fd_sniffer 0.2.0 ===");
   pinMode(PIN_BOOT, INPUT_PULLUP);
   pinMode(PIN_ACC, INPUT_PULLUP);
   
@@ -896,8 +1022,8 @@ apActive = apOk;
   server.on("/api/delete-errors", HTTP_POST, handleDeleteErrors);
   server.begin();
 
-  if (busCfg[0].enabled) startBus(&busCtx[0], 0, busCfg[0].bitrate, busCfg[0].data_bitrate);
-  if (busCfg[1].enabled) startBus(&busCtx[1], 1, busCfg[1].bitrate, busCfg[1].data_bitrate);
+  if (busCfg[0].enabled) startBus(&busCtx[0], 0, busCfg[0]);
+  if (busCfg[1].enabled) startBus(&busCtx[1], 1, busCfg[1]);
   drainToDummy();
 }
 
